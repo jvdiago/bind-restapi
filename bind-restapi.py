@@ -106,9 +106,9 @@ class MainHandler(ValidationMixin, JsonHandler):
         hostname = self.request.arguments['hostname']
 
         ttl = options.ttl
-        overide_ttl = int(self.request.arguments.get('ttl'))
-        if overide_ttl:
-            ttl = overide_ttl
+        override_ttl = self.request.arguments.get('ttl')
+        if override_ttl:
+            ttl = int(override_ttl)
 
         update = nsupdate_create_template.format(
             options.nameserver,
@@ -127,7 +127,7 @@ class MainHandler(ValidationMixin, JsonHandler):
         return_code, stdout = self._nsupdate(update)
         if return_code != 0:
             self.send_error(500, message=stdout)
-        self.send_error(201, message='Record created')
+        self.send_error(200, message='Record created')
 
     @auth
     def delete(self):
