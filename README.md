@@ -7,24 +7,45 @@ To daemonize, daemon.py is used: http://www.jejik.com/articles/2007/02/a_simple_
 
 ## Instructions
 
-    $ Customize defines inside bind-restapi.py
-    $ python bind-restapi.py start
+Customize defines inside /etc/bind-restapi.conf:
+
+``` Python
+port = 9999
+sig_key = '{"Sprint":"jfsdi489JInj39vJIOjf93==", "other":"jfi843jIb39dfjopqD93kC=="}'
+address = '0.0.0.0'
+nameserver = '192.168.1.2, 192.168.1.3'
+ttl = 86400
+secret = '123456'
+nsupdate_command = 'nsupdate'
+```
+
+Start daemon:
+
+``` Bash
+$ python bind-restapi.py start
+```
 
 ### Add a record to DNS:
 
-    $ curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "ip": "1.1.1.10", "ptr": "yes", "ttl": 86400}' http://localhost:9999/dns
+``` Bash
+$ curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none", "method": "a", "ip": "1.1.1.10", "ttl": 86400}' http://localhost:9999/dns
+$ curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none", "method": "ptr", "ip": "1.1.1.10", "ttl": 86400}' http://localhost:9999/dns
+$ curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none", "method": "cname", "cname": "www.example.com", "ttl": 86400}' http://localhost:9999/dns
+```
 
 ### Remove a record from DNS:
 
-    $ curl -X DELETE -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com"}' http://localhos    t:  9999/dns
+``` Bash
+$ curl -X DELETE -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none"}' http://localhost:9999/dns
+```
 
 ## API
 
-The API supports POST and DELETE methods to add and remove entries, respectively. On a successful POST a 201 is returned. On a successful DELETE a 200 is returned. Duplicate records are never created.
+The API supports POST and DELETE methods to add and remove entries, respectively. On a successful POST/DELETE a 200 is returned.
 
 The API can reside on a local *or* remote DNS server.
 
-On a POST request, the API adds **both** the *forward* zone **and** *reverse* in-addr.arpa zone entry *ONLY* if **{"ptr": "yes"}** is specified.
+The API supports A, PTR, CNAME method in POST.
 
 On a DELETE request, the API removes **both** the *forward* zone **and** *reverse* in-addr.arpa zone entry as a connivence 
 

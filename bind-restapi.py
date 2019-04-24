@@ -8,11 +8,13 @@ import daemon
 from subprocess import Popen, PIPE, STDOUT
 import shlex
 
-# curl -X DELETE -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com"}' http://localhost:9999/dns
-# curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "ip": "1.1.1.10" }' http://localhost:9999/dns
-# curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "ip": "1.1.1.10", "ptr": "yes", "ttl": 86400}' http://localhost:9999/dns
+# curl -X DELETE -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none"}' http://localhost:9999/dns
+# curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none", "method": "a", "ip": "1.1.1.10", "ttl": 86400}' http://localhost:9999/dns
+# curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none", "method": "ptr", "ip": "1.1.1.10", "ttl": 86400}' http://localhost:9999/dns
+# curl -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: secret' -d '{ "hostname": "host.example.com", "view": "none", "method": "cname", "cname": "www.example.com", "ttl": 86400}' http://localhost:9999/dns
 
 cwd = os.path.dirname(os.path.realpath(__file__))
+global json_sig_key
 
 define('address', default='0.0.0.0', type=str, help='Listen on interface')
 define('port', default=9999, type=int, help='Listen on port')
@@ -20,36 +22,44 @@ define('pidfile', default=os.path.join(cwd, 'bind-restapi.pid'), type=str, help=
 define('logfile', default=os.path.join(cwd, 'bind-restapi.log'), type=str, help='Log file')
 define('ttl', default='8640', type=int, help='Default TTL')
 define('nameserver', default='127.0.0.1', type=str, help='Master DNS')
-define('sig_key', default=os.path.join(cwd, 'dnnsec_key.private'), type=str, help='DNSSEC Key')
+define('sig_key', '{"none":"12345"}', type=str, help='DNSSEC Key')
 define('secret', default='secret', type=str, help='Protection Header')
 define('nsupdate_command', default='nsupdate', type=str, help='nsupdate')
 
-mandatory_create_parameters = ['ip', 'hostname']
-mandatory_delete_parameters = ['hostname']
+mandatory_create_parameters = ['method', 'hostname', 'view']
+mandatory_delete_parameters = ['hostname', 'view']
 
-nsupdate_create_template = '''\
+nsupdate_create_a = '''\
 server {0}
 update add {1} {2} A {3}
-send\
+send\n\
 '''
 nsupdate_create_ptr = '''\
-update add {0} {1} PTR {2}
-send\
+server {0}
+update add {1} {2} PTR {3}
+send\n\
+'''
+nsupdate_create_cname = '''\
+server {0}
+update add {1} {2} CNAME {3}
+send\n\
 '''
 nsupdate_delete_template = '''\
 server {0}
 update delete {1} A
 send
 update delete {1} PTR
-send\
+send
+update delete {1} CNAME
+send\n\
 '''
-
 
 def auth(func):
     def header_check(self, *args, **kwargs):
         secret_header = self.request.headers.get('X-Api-Key', None)
         if not secret_header or not options.secret == secret_header:
-            self.send_error(401, message='X-Api-Key not correct')
+            message='{"error": "X-Api-Key not correct"}'
+            self.send_error(401, message=message)
 
         return func(self, *args, **kwargs)
     return header_check
@@ -69,79 +79,131 @@ class JsonHandler(tornado.web.RequestHandler):
                 json_data = json.loads(self.request.body)
                 self.request.arguments.update(json_data)
             except ValueError:
-                message = 'Unable to parse JSON.'
+                message = '{"error": "Unable to parse JSON."}'
                 self.send_error(400, message=message) # Bad Request
 
     def set_default_headers(self):
         self.set_header('Content-Type', 'application/json')
 
     def write_error(self, status_code, **kwargs):
-        reason = self._reason
         if 'message' in kwargs:
             reason = kwargs['message']
 
-        self.finish(json.dumps({'code': status_code, 'message': reason}))
+            self.finish(json.dumps({'code': status_code, 'message': reason}))
 
 
 class ValidationMixin():
     def validate_params(self, params):
         for parameter in params:
             if parameter not in self.request.arguments:
-                self.send_error(400, message='Parameter %s not found' % parameter)
+                message='{"error": "Parameter {0} not found"}'.format(parameter)
+                self.send_error(400, message=message)
 
 
 class MainHandler(ValidationMixin, JsonHandler):
 
-    def _nsupdate(self, update):
-        cmd = '{0} -k {1}'.format(options.nsupdate_command, options.sig_key)
+    def _nsupdate(self, update, view):
+        if not view in json_sig_key:
+            return 1, "No this view named: " + view
+
+        key = json_sig_key[view]
+        cmd = '{0} -y \"{1}:{2}\"'.format(options.nsupdate_command, view, key)
         p = Popen(shlex.split(cmd), stdout=PIPE, stdin=PIPE, stderr=STDOUT)
         stdout = p.communicate(input=update)[0]
         return p.returncode, stdout.decode()
 
+    def _split_nameserver(self, server):
+       return server.split(',')
+
     @auth
     def post(self):
         self.validate_params(mandatory_create_parameters)
-
-        ip = self.request.arguments['ip']
         hostname = self.request.arguments['hostname']
-
+        view = self.request.arguments['view']
         ttl = options.ttl
         override_ttl = self.request.arguments.get('ttl')
         if override_ttl:
             ttl = int(override_ttl)
 
-        update = nsupdate_create_template.format(
-            options.nameserver,
-            hostname,
-            ttl,
-            ip)
+        nameservers = self._split_nameserver(options.nameserver)
+        method = self.request.arguments['method']
+        result = {}
+        result_code = 200
 
-        if self.request.arguments.get('ptr') == 'yes':
+        if method == 'a':
+            ip = self.request.arguments['ip']
+            for server in nameservers:
+                update = nsupdate_create_a.format(
+                    server,
+                    hostname,
+                    ttl,
+                    ip)
+                code, stdout = self._nsupdate(update, view)
+                if code == 0:
+                    result[server] = "Record created"
+                else:
+                    result[server] = stdout
+                    result_code = 500
+
+        elif method == 'ptr':
+            ip = self.request.arguments['ip']
             reverse_name = reverse_ip(ip)
-            ptr_update = nsupdate_create_ptr.format(
-                reverse_name,
-                ttl,
-                hostname)
-            update += '\n' + ptr_update
+            for server in nameservers:
+                update = nsupdate_create_ptr.format(
+                    server,
+                    reverse_name,
+                    ttl,
+                    hostname)
+                code, stdout = self._nsupdate(update, view)
+                if code == 0:
+                    result[server] = "Record created"
+                else:
+                    result[server] = stdout
+                    result_code = 500
 
-        return_code, stdout = self._nsupdate(update)
-        if return_code != 0:
-            self.send_error(500, message=stdout)
-        self.send_error(200, message='Record created')
+        elif method == 'cname':
+            cname = self.request.arguments['cname']
+            for server in nameservers:
+                update = nsupdate_create_cname.format(
+                    server,
+                    hostname,
+                    ttl,
+                    cname)
+                code, stdout = self._nsupdate(update, view)
+                if code == 0:
+                    result[server] = "Record created"
+                else:
+                    result[server] = stdout
+                    result_code = 500
+
+        else:
+            result['error'] = "Not support the method: {0}".format(method)
+            result_code = 500
+
+        self.send_error(result_code, message=result)
 
     @auth
     def delete(self):
         self.validate_params(mandatory_delete_parameters)
 
         hostname = self.request.arguments['hostname']
+        view = self.request.arguments['view']
 
-        update = nsupdate_delete_template.format(
-            options.nameserver,
-            hostname)
-        return_code, stdout = self._nsupdate(update)
-        if return_code != 0:
-            self.send_error(500, message=stdout)
-        self.send_error(200, message='Record deleted')
+        nameservers = self._split_nameserver(options.nameserver)
+        result = {}
+        result_code=200
+        for server in nameservers:
+            update = nsupdate_delete_template.format(
+                    server,
+                    hostname)
+            code, stdout = self._nsupdate(update, view)
+            if code == 0:
+                result[server] = "Record deleted"
+            else:
+                result[server] = stdout
+                result_code = 500
+
+        self.send_error(result_code, message=result)
 
 
 class Application(tornado.web.Application):
@@ -160,6 +222,23 @@ class TornadoDaemon(daemon.Daemon):
             IOLoop.instance().start()
 
 if __name__ == '__main__':
+    # Read config file
+    if os.path.isfile("./config"):
+        tornado.options.parse_config_file("./config") 
+    elif os.path.isfile("./bind-restapi.conf"):
+        tornado.options.parse_config_file("./bind-restapi.conf")
+    elif os.path.isfile("/etc/bind-restapi.conf"):
+        tornado.options.parse_config_file("/etc/bind-restapi.conf")
+
+    # Analysis sig key
+    if options.sig_key:
+        try:
+            json_sig_key = json.loads(options.sig_key)
+        except ValueError:
+            print 'Unable to parse sig key, it must be json.'
+            sys.exit(2)
+
+    # Start daemon
     daemon = TornadoDaemon(options.pidfile, stdout=options.logfile, stderr=options.logfile)
 
     if len(sys.argv) == 2:
